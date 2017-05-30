@@ -79,6 +79,8 @@ public:
     
 	ofVbo& getVbo();
     ofMesh& getOFMesh();
+    
+    void prepareDeformThreadTasks(int numThreads = 0);
 
 private:
     
@@ -116,5 +118,34 @@ private:
     
     FbxGeometryElement::EMappingMode mNormalMappingMode = FbxGeometryElement::eNone;
     
+    vector<FbxAMatrix> lClusterDeformations;
+    vector<FbxDualQuaternion> lDQClusterDeformations;
+    vector<double> lClusterWeights;
+    vector<FbxVector4> lVertices;
+    vector<FbxVector4> lNormals;
+    
+    struct DeformTask
+    {
+        FbxSkin* skin = nullptr;
+        FbxCluster* cluster = nullptr;
+        int skinIndex = -1;
+        int clusterIndex = -1;
+        int index = -1;
+        double weight = 0.0;
+        
+        DeformTask(){}
+        DeformTask(FbxSkin* s, FbxCluster* c, int si, int ci, int i, double w)
+        : skin(s), cluster(c), skinIndex(si), clusterIndex(ci), index(i), weight(w)
+        {
+        }
+    };
+    class DeformTasks : public vector<DeformTask>
+    {
+    public:
+        int startIndex = 0;
+        int endIndex = 0;
+    };
+    vector< DeformTasks > deformTasks;
+
 };
 

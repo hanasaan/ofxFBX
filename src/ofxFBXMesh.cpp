@@ -420,19 +420,24 @@ void ofxFBXMesh::updateMesh( ofMesh* aMesh, FbxTime& pTime, FbxAnimLayer * pAnim
     FbxAMatrix lGeometryOffset = GetGeometry( fbxMesh->GetNode() );
     FbxAMatrix lGlobalOffPosition = lGlobalPosition * lGeometryOffset;
     
-    FbxVector4* lVertexArray = NULL;
-    lVertexArray = new FbxVector4[ lVertexCount ];
+    if (lVertices.size() < lVertexCount) {
+        lVertices.resize(lVertexCount);
+    }
+    
+    FbxVector4* lVertexArray = &lVertices.front();
     memcpy( lVertexArray, fbxMesh->GetControlPoints(), lVertexCount * sizeof(FbxVector4) );
     
     FbxVector4* lNormalArray = NULL;
     if( aMesh->hasNormals() && aMesh->usingNormals() ) {
         if( mNormalsArray != NULL ) {
+            if (lNormals.size() < lVertexCount) {
+                lNormals.resize(lVertexCount);
+            }
 //            cout << "updateMesh :: aMesh " << aMesh->hasNormals() << " using: " << aMesh->usingNormals() << endl;
-            lNormalArray = new FbxVector4[ lVertexCount ];
+            lNormalArray = &lNormals.front();
             memcpy( lNormalArray, mNormalsArray, lVertexCount * sizeof(FbxVector4) );
         }
     }
-    
     
     if(lHasShape) {
         computeBlendShapes( aMesh, pTime, pAnimLayer );
@@ -448,6 +453,9 @@ void ofxFBXMesh::updateMesh( ofMesh* aMesh, FbxTime& pTime, FbxAnimLayer * pAnim
             computeSkinDeformation( lGlobalOffPosition, pTime, pAnimLayer, lVertexArray, lNormalArray, pPose );
         }
     }
+    
+    float t3 = ofGetElapsedTimef();
+
 //    cout << "Calling update mesh lHasShape = " << lHasShape << " skin = " << lHasSkin << " lHasDeformation = " << lHasDeformation << endl;
     
     
@@ -490,7 +498,7 @@ void ofxFBXMesh::updateMesh( ofMesh* aMesh, FbxTime& pTime, FbxAnimLayer * pAnim
             }
         }
     }
-    
+
 //    if(bAllMappedByControlPoint) {
 ////        cout << "updateMesh :: bAllMappedByControlPoint : " << endl;
 //        for(int i = 0; i < fbxMesh->GetControlPointsCount(); i++ ) {
@@ -535,12 +543,6 @@ void ofxFBXMesh::updateMesh( ofMesh* aMesh, FbxTime& pTime, FbxAnimLayer * pAnim
 //            }
 //        }
 //    }
-    
-    delete [] lVertexArray;
-    if( lNormalArray != NULL ) {
-        delete [] lNormalArray;
-    }
-    
 }
 
 
@@ -849,6 +851,102 @@ void ofxFBXMesh::computeSkinDeformation( FbxAMatrix& pGlobalPosition, FbxTime& p
 	}
 }
 
+void ofxFBXMesh::prepareDeformThreadTasks(int numThreads)
+{
+    const bool lHasShape    = fbxMesh->GetShapeCount() > 0;
+    const bool lHasSkin     = fbxMesh->GetDeformerCount(FbxDeformer::eSkin) > 0;
+    const bool lHasVertexCache = fbxMesh->GetDeformerCount(FbxDeformer::eVertexCache);
+    const bool lHasDeformation = lHasShape || lHasSkin;
+    
+    const int lVertexCount = fbxMesh->GetControlPointsCount();
+    
+    //    cout << "ofxFBXMesh :: " << getName() << " vertices: " << lVertexCount << " has blend shape: " << lHasShape << " has skin: " << lHasSkin << " has def: " << lHasDeformation << " has vertex cache: " << lHasVertexCache << " | " << ofGetFrameNum() << endl;
+    
+    if(!lHasDeformation || lVertexCount < 3) return;
+    
+    if (numThreads == 0) {
+        numThreads = max<unsigned>(1, std::thread::hardware_concurrency() - 2);
+    }
+
+    FbxCluster::ELinkMode lClusterMode = ((FbxSkin*)fbxMesh->GetDeformer(0, FbxDeformer::eSkin))->GetCluster(0)->GetLinkMode();
+    
+    int lSkinCount = fbxMesh->GetDeformerCount(FbxDeformer::eSkin);
+    
+    vector<DeformTask> linearlized_tasks;
+ 
+    FbxAMatrix lInfluence;
+    for ( int lSkinIndex=0; lSkinIndex<lSkinCount; ++lSkinIndex) {
+        FbxSkin * lSkinDeformer = (FbxSkin *)fbxMesh->GetDeformer(lSkinIndex, FbxDeformer::eSkin);
+        
+        int lClusterCount = lSkinDeformer->GetClusterCount();
+        for ( int lClusterIndex=0; lClusterIndex<lClusterCount; ++lClusterIndex) {
+            FbxCluster* lCluster = lSkinDeformer->GetCluster(lClusterIndex);
+            if (!lCluster->GetLink())
+                continue;
+            
+            int lVertexIndexCount = lCluster->GetControlPointIndicesCount();
+            for (int k = 0; k < lVertexIndexCount; ++k) {
+                int lIndex = lCluster->GetControlPointIndices()[k];
+                
+                if (lIndex >= lVertexCount)
+                    continue;
+                
+                double lWeight = lCluster->GetControlPointWeights()[k];
+                
+                if (lWeight == 0.0) {
+                    continue;
+                }
+                
+                linearlized_tasks.emplace_back(DeformTask(lSkinDeformer, lCluster,
+                                                          lSkinIndex, lClusterIndex, lIndex, lWeight));
+            }
+        }
+    }
+    
+    //
+    sort( linearlized_tasks.begin( ), linearlized_tasks.end( ), [ ]( const DeformTask& lhs, const DeformTask& rhs )
+    {
+        return lhs.index < rhs.index;
+    });
+    
+    const int base_unit_num = (linearlized_tasks.size() / numThreads) + 1;
+    cerr << base_unit_num << endl;
+    auto& tasks = deformTasks;
+    tasks.resize(numThreads);
+    int thread_index = 0;
+    for (int i=0; i<linearlized_tasks.size(); thread_index++) {
+        int unit_num = std::min<int>(base_unit_num, linearlized_tasks.size() - i);
+        if (thread_index == tasks.size() - 1) {
+            unit_num = linearlized_tasks.size() - i;
+        } else {
+            if (unit_num == base_unit_num) {
+                bool detected = false;
+                for (int j=i+unit_num; j<linearlized_tasks.size(); ++j) {
+                    if (linearlized_tasks[j].index != linearlized_tasks[j-1].index) {
+                        unit_num = j - i;
+                        detected = true;
+                        break;
+                    }
+                }
+                if (!detected) {
+                    unit_num = linearlized_tasks.size() - i;
+                }
+            }
+        }
+        tasks[thread_index].clear();
+        for (int j=i; j<i+unit_num; ++j) {
+            tasks[thread_index].emplace_back(linearlized_tasks[j]);
+        }
+        tasks[thread_index].startIndex = tasks[thread_index].front().index;
+        tasks[thread_index].endIndex = tasks[thread_index].back().index;
+        
+        cerr << "task : " << thread_index << ", " << unit_num << ", total : " << linearlized_tasks.size() <<  endl;
+        cerr << "from : " << tasks[thread_index].startIndex << ", to: " << tasks[thread_index].endIndex << endl;
+        i += unit_num;
+    }
+}
+
+
 // Deform the vertex array in classic linear way.
 void ofxFBXMesh::computeLinearDeformation(FbxAMatrix& pGlobalPosition,
                                           FbxMesh* pMesh,
@@ -861,12 +959,18 @@ void ofxFBXMesh::computeLinearDeformation(FbxAMatrix& pGlobalPosition,
     
 	int lVertexCount = pMesh->GetControlPointsCount();
     
-//    cout << "control points count = " << lVertexCount << " mesh verts = " << mesh.getNumVertices() << endl;
+    if (lClusterDeformations.size() < lVertexCount) {
+        lClusterDeformations.resize(lVertexCount);
+    }
     
-	FbxAMatrix* lClusterDeformation = new FbxAMatrix[lVertexCount];
+    FbxAMatrix* lClusterDeformation = &lClusterDeformations.front();
 	memset(lClusterDeformation, 0, lVertexCount * sizeof(FbxAMatrix));
     
-	double* lClusterWeight = new double[lVertexCount];
+    if (lClusterWeights.size() < lVertexCount) {
+        lClusterWeights.resize(lVertexCount);
+    }
+    
+    double* lClusterWeight = &lClusterWeights.front();
 	memset(lClusterWeight, 0, lVertexCount * sizeof(double));
     
 	if (lClusterMode == FbxCluster::eAdditive) {
@@ -875,97 +979,181 @@ void ofxFBXMesh::computeLinearDeformation(FbxAMatrix& pGlobalPosition,
 		}
 	}
     
-	// For all skins and all clusters, accumulate their deformation and weight
-	// on each vertices and store them in lClusterDeformation and lClusterWeight.
-	int lSkinCount = pMesh->GetDeformerCount(FbxDeformer::eSkin);
+    // For all skins and all clusters, accumulate their deformation and weight
+    // on each vertices and store them in lClusterDeformation and lClusterWeight.
+    int lSkinCount = pMesh->GetDeformerCount(FbxDeformer::eSkin);
     
-//    cout << "computeLinearDeformation :: number of skins = " << lSkinCount << endl;
-    FbxAMatrix lInfluence;// = lVertexTransformMatrix;
-	for ( int lSkinIndex=0; lSkinIndex<lSkinCount; ++lSkinIndex) {
-		FbxSkin * lSkinDeformer = (FbxSkin *)pMesh->GetDeformer(lSkinIndex, FbxDeformer::eSkin);
-		
-		int lClusterCount = lSkinDeformer->GetClusterCount();
-		for ( int lClusterIndex=0; lClusterIndex<lClusterCount; ++lClusterIndex) {
-			FbxCluster* lCluster = lSkinDeformer->GetCluster(lClusterIndex);
-			if (!lCluster->GetLink())
-				continue;
+    if (deformTasks.size()) {
+        FbxAMatrix lInfluence;
+        map<int, map<int, FbxAMatrix> > lVertexTransformMatrices;
+        for ( int lSkinIndex=0; lSkinIndex<lSkinCount; ++lSkinIndex) {
+            FbxSkin * lSkinDeformer = (FbxSkin *)pMesh->GetDeformer(lSkinIndex, FbxDeformer::eSkin);
             
-//            cout << "lClusterIndex: " << lClusterIndex << endl;
-            
-			FbxAMatrix lVertexTransformMatrix;
-			computeClusterDeformation(pGlobalPosition, pMesh, lCluster, lVertexTransformMatrix, pTime, pPose, bNormals );
-            
-			int lVertexIndexCount = lCluster->GetControlPointIndicesCount();
-			for (int k = 0; k < lVertexIndexCount; ++k) {
-				int lIndex = lCluster->GetControlPointIndices()[k];
+            int lClusterCount = lSkinDeformer->GetClusterCount();
+            for ( int lClusterIndex=0; lClusterIndex<lClusterCount; ++lClusterIndex) {
+                FbxCluster* lCluster = lSkinDeformer->GetCluster(lClusterIndex);
+                if (!lCluster->GetLink())
+                    continue;
                 
-				// Sometimes, the mesh can have less points than at the time of the skinning
-				// because a smooth operator was active when skinning but has been deactivated during export.
-				if (lIndex >= lVertexCount)
-					continue;
-                
-				double lWeight = lCluster->GetControlPointWeights()[k];
-                
-				if (lWeight == 0.0) {
-					continue;
-				}
-                
-				// Compute the influence of the link on the vertex.
-//				FbxAMatrix lInfluence = lVertexTransformMatrix;
-                lInfluence = lVertexTransformMatrix;
-				MatrixScale(lInfluence, lWeight);
-                
-				if (lClusterMode == FbxCluster::eAdditive) {
-//                    cout << "computeLinearDeformation :: clustermode = eAdditive" << endl;
-					// Multiply with the product of the deformations on the vertex.
-					MatrixAddToDiagonal(lInfluence, 1.0 - lWeight);
-					lClusterDeformation[lIndex] = lInfluence * lClusterDeformation[lIndex];
-                    
-					// Set the link to 1.0 just to know this vertex is influenced by a link.
-					lClusterWeight[lIndex] = 1.0;
-				} else // lLinkMode == FbxCluster::eNormalize || lLinkMode == FbxCluster::eTotalOne
-				{
-//                    cout << "computeLinearDeformation :: clustermode = !!eAdditive" << endl;
-//                    if(k == 0) cout << "computeLinearDeformation :: clustermode != eAdditive " << lInfluence << endl;
-					// Add to the sum of the deformations on the vertex.
-					MatrixAdd(lClusterDeformation[lIndex], lInfluence);
-                    
-					// Add to the sum of weights to either normalize or complete the vertex.
-					lClusterWeight[lIndex] += lWeight;
-				}
-			}//For each vertex
-		}//lClusterCount
-	}
-    
-	//Actually deform each vertices here by information stored in lClusterDeformation and lClusterWeight
-//    cout << "going to deform the vertices now " << endl;
-    FbxVector4 lSrcVertex;
-	for (int i = 0; i < lVertexCount; i++) {
-		lSrcVertex   = pVertexArray[i];
-		FbxVector4& lDstVertex  = pVertexArray[i];
-        
-		double lWeight = lClusterWeight[i];
-        
-		// Deform the vertex if there was at least a link with an influence on the vertex,
-		if (lWeight != 0.0) {
-			lDstVertex = lClusterDeformation[i].MultT(lSrcVertex);
-			if (lClusterMode == FbxCluster::eNormalize) {
-				// In the normalized link mode, a vertex is always totally influenced by the links.
-//                cout << i << " weight: " << lWeight << " enormalize " << endl;
-				lDstVertex /= lWeight;
-			} else if (lClusterMode == FbxCluster::eTotalOne) {
-				// In the total 1 link mode, a vertex can be partially influenced by the links.
-//                cout << i << " weight: " << lWeight << " eTotalOne " << endl;
-				lSrcVertex *= (1.0 - lWeight);
-				lDstVertex += lSrcVertex;
-			}
-		} else {
-//            cout << i << " weight is zero!! " << endl;
+                FbxAMatrix lVertexTransformMatrix;
+                computeClusterDeformation(pGlobalPosition, pMesh, lCluster, lVertexTransformMatrix, pTime, pPose, bNormals );
+                lVertexTransformMatrices[lSkinIndex][lClusterIndex] = lVertexTransformMatrix;
+            }
         }
-	}
-    
-	delete [] lClusterDeformation;
-	delete [] lClusterWeight;
+        
+        std::vector<std::thread> threads;
+        for ( int i=0; i<deformTasks.size(); i++ ) {
+            threads.emplace_back(std::thread([&](int i) {
+                if (lClusterMode == FbxCluster::eAdditive) {
+                    for (auto& t : deformTasks[i]) {
+                        // Compute the influence of the link on the vertex.
+                        FbxAMatrix lInfluence = lVertexTransformMatrices[t.skinIndex][t.clusterIndex];
+                        MatrixScale(lInfluence, t.weight);
+                        
+                        // Multiply with the product of the deformations on the vertex.
+                        MatrixAddToDiagonal(lInfluence, 1.0 - t.weight);
+                        lClusterDeformation[t.index] = lInfluence * lClusterDeformation[t.index];
+                        
+                        // Set the link to 1.0 just to know this vertex is influenced by a link.
+                        lClusterWeight[t.index] = 1.0;
+                        
+                    }
+                } else {
+                    for (auto& t : deformTasks[i]) {
+                        // Compute the influence of the link on the vertex.
+                        FbxAMatrix lInfluence = lVertexTransformMatrices[t.skinIndex][t.clusterIndex];
+                        MatrixScale(lInfluence, t.weight);
+                        
+                        // Add to the sum of the deformations on the vertex.
+                        MatrixAdd(lClusterDeformation[t.index], lInfluence);
+                        
+                        // Add to the sum of weights to either normalize or complete the vertex.
+                        lClusterWeight[t.index] += t.weight;
+                    }
+                }
+                
+                //Actually deform each vertices here by information stored in lClusterDeformation and lClusterWeight
+                FbxVector4 lSrcVertex;
+                if (lClusterMode == FbxCluster::eNormalize) {
+                    // In the normalized link mode, a vertex is always totally influenced by the links.
+                    for (int j = deformTasks[i].startIndex; j <= deformTasks[i].endIndex; j++) {
+                        lSrcVertex   = pVertexArray[j];
+                        FbxVector4& lDstVertex  = pVertexArray[j];
+                        
+                        double& lWeight = lClusterWeight[j];
+                        
+                        // Deform the vertex if there was at least a link with an influence on the vertex,
+                        if (lWeight != 0.0) {
+                            lDstVertex = lClusterDeformation[j].MultT(lSrcVertex);
+                            lDstVertex /= lWeight;
+                        }
+                    }
+                } else if (lClusterMode == FbxCluster::eTotalOne) {
+                    // In the total 1 link mode, a vertex can be partially influenced by the links.
+                    for (int j = deformTasks[i].startIndex; j <= deformTasks[i].endIndex; j++) {
+                        lSrcVertex   = pVertexArray[j];
+                        FbxVector4& lDstVertex  = pVertexArray[j];
+                        
+                        double& lWeight = lClusterWeight[j];
+                        
+                        // Deform the vertex if there was at least a link with an influence on the vertex,
+                        if (lWeight != 0.0) {
+                            lDstVertex = lClusterDeformation[j].MultT(lSrcVertex);
+                            lSrcVertex *= (1.0 - lWeight);
+                            lDstVertex += lSrcVertex;
+                        }
+                    }
+                }
+                
+            }, i));
+        }
+        for (std::thread &th : threads) {
+            th.join();
+        }
+    } else {
+        FbxAMatrix lInfluence;
+        for ( int lSkinIndex=0; lSkinIndex<lSkinCount; ++lSkinIndex) {
+            FbxSkin * lSkinDeformer = (FbxSkin *)pMesh->GetDeformer(lSkinIndex, FbxDeformer::eSkin);
+            
+            int lClusterCount = lSkinDeformer->GetClusterCount();
+            for ( int lClusterIndex=0; lClusterIndex<lClusterCount; ++lClusterIndex) {
+                FbxCluster* lCluster = lSkinDeformer->GetCluster(lClusterIndex);
+                if (!lCluster->GetLink())
+                    continue;
+                
+                FbxAMatrix lVertexTransformMatrix;
+                computeClusterDeformation(pGlobalPosition, pMesh, lCluster, lVertexTransformMatrix, pTime, pPose, bNormals );
+                
+                int lVertexIndexCount = lCluster->GetControlPointIndicesCount();
+                for (int k = 0; k < lVertexIndexCount; ++k) {
+                    int lIndex = lCluster->GetControlPointIndices()[k];
+                    
+                    // Sometimes, the mesh can have less points than at the time of the skinning
+                    // because a smooth operator was active when skinning but has been deactivated during export.
+                    if (lIndex >= lVertexCount)
+                        continue;
+                    
+                    double lWeight = lCluster->GetControlPointWeights()[k];
+                    
+                    if (lWeight == 0.0) {
+                        continue;
+                    }
+                    
+                    // Compute the influence of the link on the vertex.
+                    lInfluence = lVertexTransformMatrix;
+                    MatrixScale(lInfluence, lWeight);
+                    
+                    if (lClusterMode == FbxCluster::eAdditive) {
+                        // Multiply with the product of the deformations on the vertex.
+                        MatrixAddToDiagonal(lInfluence, 1.0 - lWeight);
+                        lClusterDeformation[lIndex] = lInfluence * lClusterDeformation[lIndex];
+                        
+                        // Set the link to 1.0 just to know this vertex is influenced by a link.
+                        lClusterWeight[lIndex] = 1.0;
+                    } else {
+                        // Add to the sum of the deformations on the vertex.
+                        MatrixAdd(lClusterDeformation[lIndex], lInfluence);
+                        
+                        // Add to the sum of weights to either normalize or complete the vertex.
+                        lClusterWeight[lIndex] += lWeight;
+                    }
+                }//For each vertex
+            }//lClusterCount
+        }
+        
+        //Actually deform each vertices here by information stored in lClusterDeformation and lClusterWeight
+        FbxVector4 lSrcVertex;
+        if (lClusterMode == FbxCluster::eNormalize) {
+            // In the normalized link mode, a vertex is always totally influenced by the links.
+            for (int i = 0; i < lVertexCount; i++) {
+                lSrcVertex   = pVertexArray[i];
+                FbxVector4& lDstVertex  = pVertexArray[i];
+                
+                double& lWeight = lClusterWeight[i];
+                
+                // Deform the vertex if there was at least a link with an influence on the vertex,
+                if (lWeight != 0.0) {
+                    lDstVertex = lClusterDeformation[i].MultT(lSrcVertex);
+                    lDstVertex /= lWeight;
+                }
+            }
+        } else if (lClusterMode == FbxCluster::eTotalOne) {
+            // In the total 1 link mode, a vertex can be partially influenced by the links.
+            for (int i = 0; i < lVertexCount; i++) {
+                lSrcVertex   = pVertexArray[i];
+                FbxVector4& lDstVertex  = pVertexArray[i];
+                
+                double& lWeight = lClusterWeight[i];
+                
+                // Deform the vertex if there was at least a link with an influence on the vertex,
+                if (lWeight != 0.0) {
+                    lDstVertex = lClusterDeformation[i].MultT(lSrcVertex);
+                    lSrcVertex *= (1.0 - lWeight);
+                    lDstVertex += lSrcVertex;
+                }
+            }
+        }
+    }
 }
 
 
@@ -982,11 +1170,19 @@ void ofxFBXMesh::computeDualQuaternionDeformation(FbxAMatrix& pGlobalPosition,
 	int lVertexCount    = pMesh->GetControlPointsCount();
 	int lSkinCount      = pMesh->GetDeformerCount(FbxDeformer::eSkin);
     
-	FbxDualQuaternion* lDQClusterDeformation = new FbxDualQuaternion[lVertexCount];
+    if (lDQClusterDeformations.size() < lVertexCount) {
+        lDQClusterDeformations.resize(lVertexCount);
+    }
+    
+	FbxDualQuaternion* lDQClusterDeformation = &lDQClusterDeformations.front();
 	memset(lDQClusterDeformation, 0, lVertexCount * sizeof(FbxDualQuaternion));
     
-	double* lClusterWeight = new double[lVertexCount];
-	memset(lClusterWeight, 0, lVertexCount * sizeof(double));
+    if (lClusterWeights.size() < lVertexCount) {
+        lClusterWeights.resize(lVertexCount);
+    }
+    
+    double* lClusterWeight = &lClusterWeights.front();
+    memset(lClusterWeight, 0, lVertexCount * sizeof(double));
     
 	// For all skins and all clusters, accumulate their deformation and weight
 	// on each vertices and store them in lClusterDeformation and lClusterWeight.

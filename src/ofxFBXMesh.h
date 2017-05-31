@@ -125,7 +125,6 @@ private:
     FbxGeometryElement::EMappingMode mNormalMappingMode = FbxGeometryElement::eNone;
     
     vector<FbxAMatrix> lClusterDeformations;
-    vector<FbxAMatrix> lNormalClusterDeformations;
     vector<FbxDualQuaternion> lDQClusterDeformations;
     vector<double> lClusterWeights;
     vector<FbxVector4> lVertices;

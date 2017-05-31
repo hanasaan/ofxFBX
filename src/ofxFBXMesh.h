@@ -92,6 +92,12 @@ private:
                                   FbxVector4* pVertexArray,
                                   FbxPose* pPose,
                                   bool bNormals);
+    void computeLinearDeformationWithNormals(FbxAMatrix& pGlobalPosition,
+                                  FbxMesh* pMesh,
+                                  FbxTime& pTime,
+                                  FbxVector4* pVertexArray,
+                                  FbxVector4* pNormalArray,
+                                  FbxPose* pPose);
     void computeDualQuaternionDeformation(FbxAMatrix& pGlobalPosition,
                                           FbxMesh* pMesh,
                                           FbxTime& pTime,
@@ -119,6 +125,7 @@ private:
     FbxGeometryElement::EMappingMode mNormalMappingMode = FbxGeometryElement::eNone;
     
     vector<FbxAMatrix> lClusterDeformations;
+    vector<FbxAMatrix> lNormalClusterDeformations;
     vector<FbxDualQuaternion> lDQClusterDeformations;
     vector<double> lClusterWeights;
     vector<FbxVector4> lVertices;

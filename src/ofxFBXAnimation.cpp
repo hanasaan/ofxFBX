@@ -64,10 +64,14 @@ void ofxFBXAnimation::update( float aElapsedTimeSeconds ) {
 		//cout << "etimeMillis: " << etimeMillis << " argMillis: " << (aElapsedTimeSeconds * 1000) << " secs: " << aElapsedTimeSeconds << " | " << ofGetFrameNum() << endl;
         if(etimeMillis - lastUpdateTimeMillis >= tframeTime ) {
             bNewFrame = true;
-            if( _speed >= 0 ) {
-                fbxCurrentTime += (fbxFrameTime);
+            if (aElapsedTimeSeconds < 0) {
+                if( _speed >= 0 ) {
+                    fbxCurrentTime += (fbxFrameTime);
+                } else {
+                    fbxCurrentTime -= (fbxFrameTime);
+                }
             } else {
-                fbxCurrentTime -= (fbxFrameTime);
+                fbxCurrentTime.SetSecondDouble(aElapsedTimeSeconds);
             }
             lastUpdateTimeMillis = etimeMillis;
         }
